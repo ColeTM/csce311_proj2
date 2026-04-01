@@ -11,18 +11,75 @@
 #include<csignal>
 #include<cstdint>
 #include<vector>
+#include<cstring>
+#include<queue>
+#include<sys/sysinfo.h>
+#include<semaphore.h>
 
 using namespace proj2;
 
+// struct to hold info about a single file in a datagram request
 struct File {
   std::string path;
-  uint32_t num_rows;
+  std::uint32_t num_rows;
 };
 
+// struct to hold a datagram request's endpoint and all of its files' info
 struct DatagramContent {
   std::string endpoint;
   std::vector<File> files;
 };
+
+std::queue<std::string> msg_queue;
+pthread_mutex_t msg_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+sem_t msg_semaphore;
+
+DatagramContent ParseMessage(const std::string msg) {
+  DatagramContent ret;  // initialize datagram to return
+  const char* m = msg.data();  // pointer m points to beginning of msg
+  // parse length of endpoint name
+  std::uint32_t endpoint_length;
+  std::memcpy(&endpoint_length, m, 4);
+  m += 4;
+  // parse endpoint name
+  ret.endpoint = std::string(m, endpoint_length);
+  m += endpoint_length;
+  // parse number of files to read
+  std::uint32_t file_count;
+  std::memcpy(&file_count, m, 4);
+  m += 4;
+  
+  // loop through rest of the msg to get all files
+  for (std::uint32_t i = 0; i < file_count; ++i) {
+    File f; // initialize file to create
+    // parse length of path for each file
+    std::uint32_t path_length;
+    std::memcpy(&path_length, m, 4);
+    m += 4;
+    // parse file path
+    f.path = std::string(m, path_length);
+    m += path_length;
+    // parse number of rows in the file
+    std::uint32_t row_count;
+    std::memcpy(&row_count, m, 4);
+    m += 4;
+    f.num_rows = row_count;
+    // add file to list of files in datagram
+    ret.files.push_back(f);
+  }
+  return ret;
+}
+
+void* StartRoutine(void* arg) {
+  sem_wait(&msg_semaphore);
+  pthread_mutex_lock(&msg_queue_mutex);
+  std::string msg = msg_queue.front();
+  msg_queue.pop();
+  pthread_mutex_unlock(&msg_queue_mutex);
+  DatagramContent dg = ParseMessage(msg);
+  
+  return nullptr;
+}
 
 volatile sig_atomic_t terminate = 0;
 
@@ -31,15 +88,21 @@ void handle_signal(int) {
 }
 
 int main(int argc, char* argv[]) {
-
+  // validate input, print usage message if incorrect
   if (argc < 4) {
-    std::cout << "usage: bin/proj2-server [server name] "
-      << "[num file readers] [num SHA solvers]" << std::endl;
+    std::cout << "usage: bin/proj2-server <server_name> "
+      << "<num_file_readers> <num_SHA_solvers>" << std::endl;
+    return 1;
   }
-  
+  // parse command line
   std::string server_name = argv[1];
   int num_file_readers = std::stoi(argv[2]);
   int num_sha_solvers = std::stoi(argv[3]);
+  // make sure there are readers and solvers
+  if (num_file_readers < 1 || num_sha_solvers < 1) {
+    std::cout << "need readers and solvers to execute" << std::endl;
+    return 1;
+  }
   
   std::signal(SIGINT, handle_signal);
   std::signal(SIGTERM, handle_signal);
@@ -51,16 +114,36 @@ int main(int argc, char* argv[]) {
   UnixDomainDatagramEndpoint dgram_server(server_name);
   dgram_server.Init();
   
+  // initialize semaphore
+  sem_init(&msg_semaphore, 0, 0);
+  // spin up threads
+  int num_threads = get_nprocs();
+  pthread_t threads[num_threads];
+  for (int i = 0; i < num_threads; ++i)
+    pthread_create(&threads[i], nullptr, StartRoutine, nullptr);
+  
   while (!terminate) {
-
     std::string whatever;
     std::string msg = dgram_server.RecvFrom(&whatever, 65000);
+    
+    pthread_mutex_lock(&msg_queue_mutex);
+    msg_queue.push(msg);
+    pthread_mutex_unlock(&msg_queue_mutex);
+    sem_post(&msg_semaphore);
 
   }
   
   
   
+  for (int i = 0; i < num_threads; ++i)
+    sem_post(&msg_semaphore);
   
+  sem_destroy(&msg_semaphore);
+  pthread_mutex_destroy(&msg_queue_mutex);
+
+  return 0;
+}
+
   // 3. wait in a blocking loop for datagrams
   
   // 4. dispatch a thread to parse each request
@@ -69,11 +152,8 @@ int main(int argc, char* argv[]) {
   
   // 6. use reader to process client request in hashes
   
-  // 7. concatenate sets into one bye string (ordered by file oreder)
+  // 7. concatenate sets into one byte string (ordered by file oreder)
   
   // 8. connect to the client's reply socket (stream)
   
   // 9. stream concatenated hashes' string
-
-  return 0;
-}
