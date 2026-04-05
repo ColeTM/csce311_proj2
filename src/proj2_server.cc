@@ -30,6 +30,12 @@ struct DatagramContent {
   std::vector<File> files;
 };
 
+volatile sig_atomic_t terminate = 0;
+
+void handle_signal(int) {
+  terminate = 1;
+}
+
 std::queue<std::string> msg_queue;
 pthread_mutex_t msg_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 sem_t msg_semaphore;
@@ -71,21 +77,53 @@ DatagramContent ParseMessage(const std::string msg) {
 }
 
 void* StartRoutine(void* arg) {
-  sem_wait(&msg_semaphore);
-  pthread_mutex_lock(&msg_queue_mutex);
-  std::string msg = msg_queue.front();
-  msg_queue.pop();
-  pthread_mutex_unlock(&msg_queue_mutex);
-  DatagramContent dg = ParseMessage(msg);
+  for(;;) {
+    sem_wait(&msg_semaphore);
+    if (terminate && msg_queue.empty())
+      return nullptr;
+      
+    pthread_mutex_lock(&msg_queue_mutex);
+    std::string msg = msg_queue.front();
+    msg_queue.pop();
+    pthread_mutex_unlock(&msg_queue_mutex);
+    DatagramContent dg = ParseMessage(msg);
+    
+    std::uint32_t max_rows = 0;
+    for (std::uint32_t i = 0; i < dg.files.size(); ++i) {
+      if (dg.files[i].num_rows > max_rows)
+        max_rows = dg.files[i].num_rows;
+    }
+    
+    SolverHandle solvers = ShaSolvers::Checkout(max_rows);
+    ReaderHandle readers = FileReaders::Checkout(dg.files.size(), &solvers);
+    
+    std::vector<std::string> paths;
+    std::vector<std::uint32_t> row_counts;
+    for (std::uint32_t i = 0; i < dg.files.size(); ++i) {
+      paths.push_back(dg.files[i].path);
+      row_counts.push_back(dg.files[i].num_rows);
+    }
+    
+    std::vector<std::vector<ReaderHandle::HashType>> hashes;
+    readers.Process(paths, row_counts, &hashes);
+    
+    FileReaders::Checkin(std::move(readers));
+    ShaSolvers::Checkin(std::move(solvers));
+    
+    std::string hashes_concat;
+    for (auto& file_hashes : hashes) {
+      for (auto& hash : file_hashes)
+        hashes_concat.append(hash.data(), 64);
+    }
+    
+    UnixDomainStreamClient reply(dg.endpoint);
+    reply.Init();
+    reply.Write(hashes_concat.data(), hashes_concat.size());
+  }
   
   return nullptr;
 }
 
-volatile sig_atomic_t terminate = 0;
-
-void handle_signal(int) {
-  terminate = 1;
-}
 
 int main(int argc, char* argv[]) {
   // validate input, print usage message if incorrect
@@ -140,20 +178,13 @@ int main(int argc, char* argv[]) {
   
   sem_destroy(&msg_semaphore);
   pthread_mutex_destroy(&msg_queue_mutex);
+  
+  
+  // probably need this
+  for (int i = 0; i < num_threads; ++i)
+    pthread_join(threads[i], nullptr);
+    
+  StopLog();
 
   return 0;
 }
-
-  // 3. wait in a blocking loop for datagrams
-  
-  // 4. dispatch a thread to parse each request
-  
-  // 5. acquire required solver and reader resources
-  
-  // 6. use reader to process client request in hashes
-  
-  // 7. concatenate sets into one byte string (ordered by file oreder)
-  
-  // 8. connect to the client's reply socket (stream)
-  
-  // 9. stream concatenated hashes' string
