@@ -1,22 +1,23 @@
 // copyright ColeTM 2026
 
-#include"proj2/lib/domain_socket.h"
-#include"proj2/lib/file_reader.h"
-#include"proj2/lib/sha_solver.h"
-#include"proj2/lib/thread_log.h"
-#include"proj2/lib/timings.h"
-#include<iostream>
 #include<pthread.h>
+#include<sys/sysinfo.h>
+#include<semaphore.h>
+#include<sys/socket.h>
+#include<sys/time.h>
+#include<iostream>
 #include<string>
 #include<csignal>
 #include<cstdint>
 #include<vector>
 #include<cstring>
 #include<queue>
-#include<sys/sysinfo.h>
-#include<semaphore.h>
-
-using namespace proj2;
+#include<stdexcept>
+#include"proj2/lib/domain_socket.h"
+#include"proj2/lib/file_reader.h"
+#include"proj2/lib/sha_solver.h"
+#include"proj2/lib/thread_log.h"
+#include"proj2/lib/timings.h"
 
 // struct to hold info about a single file in a datagram request
 struct File {
@@ -30,8 +31,9 @@ struct DatagramContent {
   std::vector<File> files;
 };
 
+// initialize terminate value to 0 (false)
 volatile sig_atomic_t terminate = 0;
-
+// this function is called by SIGINT and SIGTERM
 void handle_signal(int) {
   terminate = 1;
 }
@@ -55,10 +57,10 @@ DatagramContent ParseMessage(const std::string msg) {
   std::uint32_t file_count;
   std::memcpy(&file_count, m, 4);
   m += 4;
-  
+
   // loop through rest of the msg to get all files
   for (std::uint32_t i = 0; i < file_count; ++i) {
-    File f; // initialize file to create
+    File f;  // initialize file to create
     // parse length of path for each file
     std::uint32_t path_length;
     std::memcpy(&path_length, m, 4);
@@ -78,8 +80,8 @@ DatagramContent ParseMessage(const std::string msg) {
 }
 
 // function that each thread executes
-void* StartRoutine(void* arg) {
-  for(;;) {
+void* StartRoutine(void*) {
+  for (;;) {
     // decrement semaphore, or wait until value > 0
     sem_wait(&msg_semaphore);
     // check if process has been terminated
@@ -92,7 +94,7 @@ void* StartRoutine(void* arg) {
     msg_queue.pop();
     pthread_mutex_unlock(&msg_queue_mutex);
     DatagramContent dg = ParseMessage(msg);
-    
+
     // find the maximum number of rows from the files in the datagram
     std::uint32_t max_rows = 0;
     for (std::uint32_t i = 0; i < dg.files.size(); ++i) {
@@ -109,16 +111,18 @@ void* StartRoutine(void* arg) {
     }
 
     // acquire solver and reader resources
-    SolverHandle solvers = ShaSolvers::Checkout(max_rows);
-    ReaderHandle readers = FileReaders::Checkout(dg.files.size(), &solvers);
+    proj2::SolverHandle solvers = proj2::ShaSolvers::Checkout(max_rows);
+    proj2::ReaderHandle readers = proj2::FileReaders::Checkout(dg.files.size(),
+                                                                &solvers);
 
     // initialize the hashings results table and perform hashes
-    std::vector<std::vector<ReaderHandle::HashType>> hashes(dg.files.size());
+    std::vector<std::vector<proj2::ReaderHandle::HashType>>
+                                                       hashes(dg.files.size());
     readers.Process(paths, row_counts, &hashes);
 
     // return reader and solver resources
-    FileReaders::Checkin(std::move(readers));
-    ShaSolvers::Checkin(std::move(solvers));
+    proj2::FileReaders::Checkin(std::move(readers));
+    proj2::ShaSolvers::Checkin(std::move(solvers));
 
     // concatenate all hashes into one long string
     std::string hashes_concat;
@@ -127,7 +131,7 @@ void* StartRoutine(void* arg) {
         hashes_concat.append(hash.data(), 64);
     }
     // connect to client reply socket and stream the hashes
-    UnixDomainStreamClient reply(dg.endpoint);
+    proj2::UnixDomainStreamClient reply(dg.endpoint);
     reply.Init();
     reply.Write(hashes_concat.data(), hashes_concat.size());
   }
@@ -156,25 +160,38 @@ int main(int argc, char* argv[]) {
   std::signal(SIGTERM, handle_signal);
 
   // intialize thread pools for file readers and SHA solvers
-  FileReaders::Init(num_file_readers);
-  ShaSolvers::Init(num_sha_solvers);
+  proj2::FileReaders::Init(num_file_readers);
+  proj2::ShaSolvers::Init(num_sha_solvers);
   // bind to a Unix domain datagram socket
-  UnixDomainDatagramEndpoint dgram_server(server_name);
+  proj2::UnixDomainDatagramEndpoint dgram_server(server_name);
   dgram_server.Init();
+
+  // create timeval to set timeout interval
+  timeval tv;
+  tv.tv_sec = 1;
+  tv.tv_usec = 0;
+  // while waiting, server socket checks for terminate ever second
+  setsockopt(dgram_server.socket_fd(), SOL_SOCKET, SO_RCVTIMEO,
+              &tv, sizeof(tv));
 
   // initialize semaphore
   sem_init(&msg_semaphore, 0, 0);
   // spin up threads
   int num_threads = get_nprocs();
-  pthread_t threads[num_threads];
+  std::vector<pthread_t> threads(num_threads);
   for (int i = 0; i < num_threads; ++i)
     pthread_create(&threads[i], nullptr, StartRoutine, nullptr);
 
   // server continues to run until instructed to terminate
   while (!terminate) {
     std::string whatever;
+    std::string msg;
     // wait for datagrams to be sent
-    std::string msg = dgram_server.RecvFrom(&whatever, 65000);
+    try {
+      msg = dgram_server.RecvFrom(&whatever, 65000);
+    } catch (const std::runtime_error& e) {
+      continue;
+    }
 
     pthread_mutex_lock(&msg_queue_mutex);    // lock mutex
     msg_queue.push(msg);                     // add datagram to queue
